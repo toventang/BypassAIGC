@@ -113,6 +113,64 @@ def _add_performance_indexes():
         # 失败不应该阻止应用启动
 
 
+def _relax_legacy_users_required_card_columns(conn):
+    """旧卡密库把 card_key/access_link 设为 NOT NULL，新用户名用户需要允许为空。"""
+    if engine.dialect.name != "sqlite":
+        return False
+
+    table_info = conn.execute(text("PRAGMA table_info(users)")).mappings().all()
+    columns = {column["name"]: column for column in table_info}
+    required_columns = {"card_key", "access_link"}
+    if not required_columns.issubset(columns):
+        return False
+
+    needs_rebuild = any(columns[column]["notnull"] for column in required_columns)
+    if not needs_rebuild:
+        return False
+
+    copy_columns = [
+        "id",
+        "username",
+        "password_hash",
+        "display_name",
+        "card_key",
+        "access_link",
+        "is_active",
+        "created_at",
+        "last_used",
+        "usage_limit",
+        "usage_count",
+    ]
+    existing_copy_columns = [column for column in copy_columns if column in columns]
+    column_sql = ", ".join(existing_copy_columns)
+
+    conn.execute(text("PRAGMA foreign_keys=OFF"))
+    conn.execute(text("""
+        CREATE TABLE users_new (
+            id INTEGER NOT NULL PRIMARY KEY,
+            username VARCHAR(255),
+            password_hash VARCHAR(255),
+            display_name VARCHAR(255),
+            card_key VARCHAR(255),
+            access_link VARCHAR(255),
+            is_active BOOLEAN,
+            created_at DATETIME,
+            last_used DATETIME,
+            usage_limit INTEGER DEFAULT 0,
+            usage_count INTEGER DEFAULT 0
+        )
+    """))
+    conn.execute(text(f"INSERT INTO users_new ({column_sql}) SELECT {column_sql} FROM users"))
+    conn.execute(text("DROP TABLE users"))
+    conn.execute(text("ALTER TABLE users_new RENAME TO users"))
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username ON users (username)"))
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_card_key ON users (card_key)"))
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_access_link ON users (access_link)"))
+    conn.execute(text("PRAGMA foreign_keys=ON"))
+    conn.commit()
+    return True
+
+
 def _migrate_database_schema():
     """迁移数据库结构 - 添加新列到已存在的表"""
     try:
@@ -145,23 +203,37 @@ def _migrate_database_schema():
                 # 迁移 users 表
                 if "users" in tables:
                     user_columns = {column["name"] for column in inspector.get_columns("users")}
-                    
+
+                    if "username" not in user_columns:
+                        if _add_column_safely(conn, "users", "username", "VARCHAR(255)"):
+                            print("  ✓ 添加字段: users.username")
+
+                    if "password_hash" not in user_columns:
+                        if _add_column_safely(conn, "users", "password_hash", "VARCHAR(255)"):
+                            print("  ✓ 添加字段: users.password_hash")
+
+                    if "display_name" not in user_columns:
+                        if _add_column_safely(conn, "users", "display_name", "VARCHAR(255)"):
+                            print("  ✓ 添加字段: users.display_name")
+
                     if "usage_limit" not in user_columns:
-                        if _add_column_safely(conn, "users", "usage_limit", f"INTEGER DEFAULT {settings.DEFAULT_USAGE_LIMIT}"):
+                        if _add_column_safely(conn, "users", "usage_limit", "INTEGER DEFAULT 0"):
                             print("  ✓ 添加字段: users.usage_limit")
-                    
+
                     if "usage_count" not in user_columns:
                         if _add_column_safely(conn, "users", "usage_count", "INTEGER DEFAULT 0"):
                             print("  ✓ 添加字段: users.usage_count")
-                    
-                    # 更新 NULL 值
+
                     try:
-                        conn.execute(text(f"UPDATE users SET usage_limit = {settings.DEFAULT_USAGE_LIMIT} WHERE usage_limit IS NULL"))
+                        conn.execute(text("UPDATE users SET usage_limit = 0 WHERE usage_limit IS NULL"))
                         conn.execute(text("UPDATE users SET usage_count = 0 WHERE usage_count IS NULL"))
                         conn.commit()
                     except Exception:
                         conn.rollback()
-            
+
+                    if _relax_legacy_users_required_card_columns(conn):
+                        print("  ✓ 迁移字段约束: users.card_key/access_link 允许为空")
+
                 # 迁移 optimization_segments 表
                 if "optimization_segments" in tables:
                     segment_columns = {column["name"] for column in inspector.get_columns("optimization_segments")}

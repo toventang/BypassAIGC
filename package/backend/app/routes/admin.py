@@ -18,11 +18,19 @@ from app.models.models import (
     User,
 )
 from app.schemas import (
+    AdminUserCreate,
     CardKeyGenerate,
     CardKeyResponse,
     DatabaseUpdateRequest,
     UserResponse,
     UserUsageUpdate,
+)
+from app.utils.auth import (
+    create_access_token,
+    generate_access_link,
+    generate_card_key,
+    hash_password,
+    verify_token,
 )
 from app.services.concurrency import concurrency_manager
 from app.word_formatter.services.job_manager import get_job_manager
@@ -70,6 +78,24 @@ def verify_admin_credentials(username: str, password: str) -> bool:
     return username == settings.ADMIN_USERNAME and password == settings.ADMIN_PASSWORD
 
 
+def _reload_admin_credentials():
+    """只重读 .env 中的管理员凭据"""
+    import os as _os
+    from app.config import get_env_file_path
+    env_path = get_env_file_path()
+    if not _os.path.exists(env_path):
+        return
+    with open(env_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                if key in ('ADMIN_USERNAME', 'ADMIN_PASSWORD'):
+                    setattr(settings, key, value)
+
+
 def verify_admin_token(token: str) -> bool:
     payload = verify_token(token)
     if not payload:
@@ -97,9 +123,11 @@ def _model_to_dict(record: Any) -> Dict[str, Any]:
 
 @router.post("/login", response_model=AdminLoginResponse)
 async def admin_login(credentials: AdminLogin) -> AdminLoginResponse:
-    # 速率限制: 每分钟最多5次登录尝试 (在 main.py 的 limiter 中配置)
     if not verify_admin_credentials(credentials.username, credentials.password):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
+        # 手动改了 .env 没重启？只重读密码，不动整个 settings
+        _reload_admin_credentials()
+        if not verify_admin_credentials(credentials.username, credentials.password):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
 
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -192,6 +220,38 @@ async def batch_generate_keys(
 @router.get("/users", response_model=List[UserResponse])
 async def get_all_users(_: str = Depends(get_admin_from_token), db: Session = Depends(get_db)) -> List[User]:
     return db.query(User).order_by(User.created_at.desc()).all()
+
+
+@router.post("/users/create")
+async def create_users(
+    users: List[AdminUserCreate],
+    _: str = Depends(get_admin_from_token),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """批量创建用户（用户名+密码）"""
+    created = []
+    skipped = []
+    for u in users:
+        existing = db.query(User).filter(User.username == u.username).first()
+        if existing:
+            skipped.append(u.username)
+            continue
+        user = User(
+            username=u.username,
+            password_hash=hash_password(u.password),
+            display_name=u.display_name,
+            is_active=True,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        created.append({
+            "id": user.id,
+            "username": user.username,
+            "display_name": user.display_name,
+            "created_at": user.created_at,
+        })
+    return {"created": created, "skipped": skipped, "total_created": len(created)}
 
 
 @router.patch("/users/{user_id}/toggle")
@@ -540,6 +600,7 @@ async def get_all_sessions(
             "session_id": session.id,
             "user_id": session.user_id,
             "card_key": session.user.card_key if session.user else None,
+            "username": session.user.username if session.user else None,
             "status": session.status,
             "processing_mode": session.processing_mode,
             "original_char_count": original_length_map.get(session.id, 0),
@@ -754,8 +815,8 @@ async def get_config(_: str = Depends(get_admin_from_token)) -> Dict[str, Any]:
         },
         "system": {
             "max_concurrent_users": settings.MAX_CONCURRENT_USERS,
+            "max_concurrent_per_user": settings.MAX_CONCURRENT_PER_USER,
             "history_compression_threshold": settings.HISTORY_COMPRESSION_THRESHOLD,
-            "default_usage_limit": settings.DEFAULT_USAGE_LIMIT,
             "segment_skip_threshold": settings.SEGMENT_SKIP_THRESHOLD,
             "use_streaming": settings.USE_STREAMING,
             "max_upload_file_size_mb": settings.MAX_UPLOAD_FILE_SIZE_MB,
